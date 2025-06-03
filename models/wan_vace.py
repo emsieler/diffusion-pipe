@@ -210,6 +210,8 @@ class WanVacePipeline(WanPipeline):
                 dtype_to_use = dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
                 set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
 
+        # Move model to CUDA after loading
+        self.transformer = self.transformer.cuda()
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
@@ -253,10 +255,10 @@ class WanVacePipeline(WanPipeline):
         
     def prepare_inputs(self, inputs, timestep_quantile=None):
         # Keep latents in float32 like the regular pipeline
-        latents = inputs['latents'].float()
-        text_embeddings = inputs['text_embeddings']
-        seq_lens = inputs['seq_lens']
-        mask = inputs['mask']
+        latents = inputs['latents'].float().cuda()
+        text_embeddings = [emb.cuda() for emb in inputs['text_embeddings']]
+        seq_lens = inputs['seq_lens'].cuda()
+        mask = inputs['mask'].cuda() if inputs['mask'] is not None else None
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -299,15 +301,16 @@ class WanVacePipeline(WanPipeline):
         # Get initial embeddings for the main input - explicitly set dtype to match model
         model_dtype = self.transformer.patch_embedding.weight.dtype
         x = [self.transformer.patch_embedding(u.unsqueeze(0).to(dtype=model_dtype)) for u in x_t]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long, device=x[0].device) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_len = max([u.size(1) for u in x])
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
-        # Create time embeddings - these must stay in float32
-        e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t).to(x.device, torch.float32))
+        # Create time embeddings - match model dtype
+        t_model_dtype = t.to(dtype=model_dtype)
+        e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t_model_dtype).to(x.device, dtype=model_dtype))
         e0 = self.transformer.time_projection(e).unflatten(1, (6, self.transformer.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        assert e.dtype == model_dtype and e0.dtype == model_dtype, f"Time embeddings not in {model_dtype}: e={e.dtype}, e0={e0.dtype}"
 
         # Process text embeddings - explicitly set dtype to match model
         context = [emb[:length].to(dtype=model_dtype) for emb, length in zip(text_embeddings, seq_lens)]
@@ -318,10 +321,41 @@ class WanVacePipeline(WanPipeline):
             ]))
 
         # Create VACE context from latents and masks - explicitly set dtype to match model
-        vace_context = [torch.cat([l.to(dtype=model_dtype), 
-                                 m.to(dtype=model_dtype) if m is not None else None], 
-                                dim=0) if m is not None else l.to(dtype=model_dtype) 
-                       for l, m in zip(x_t, mask)]
+        vace_context = []
+        print("\nDebug tensor shapes:")
+        print("x_t[0] shape:", x_t[0].shape)
+        print("x_t[0] dims:", x_t[0].dim())
+        for i, l in enumerate(x_t):
+            print(f"\nProcessing tensor {i}:")
+            print("Original shape:", l.shape)
+            print("Original dims:", l.dim())
+            
+            # Input shape is [batch, frames, channels, height]
+            # Need to get to [batch, channels, frames, height] for conv3d
+            l = l.permute(0, 2, 1, 3)  # Move channels (96) to position 1
+            print("After permute - l shape:", l.shape)
+            print("After permute - l dims:", l.dim())
+            
+            if mask is not None:
+                m = mask.unsqueeze(1).permute(0, 2, 1, 3)  # Add channel dim and permute
+                print("After permute - m shape:", m.shape)
+                print("After permute - m dims:", m.dim())
+                vace_context.append(torch.cat([l.to(dtype=model_dtype), 
+                                            m.to(dtype=model_dtype)], dim=1))  # Concatenate along channel dimension
+            else:
+                vace_context.append(l.to(dtype=model_dtype))
+        
+        # Stack all tensors along batch dimension and ensure correct channel ordering
+        vace_context = torch.stack(vace_context, dim=0)  # [batch, channels, frames, height]
+        print("\nBefore final permute:")
+        print("Shape:", vace_context.shape)
+        print("Dims:", vace_context.dim())
+        
+        # Final permutation to get [batch, channels, frames, height, width] for conv3d
+        vace_context = vace_context.permute(0, 2, 1, 3, 4)  # Move channels back to position 1
+        print("\nFinal vace_context:")
+        print("Shape:", vace_context.shape)
+        print("Dims:", vace_context.dim())
         
         # Generate hints using forward_vace
         vace_block_args = dict(
@@ -329,7 +363,7 @@ class WanVacePipeline(WanPipeline):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.transformer.freqs,
+            freqs=self.transformer.freqs.to(x.device),
             context=context,
             context_lens=None
         )
