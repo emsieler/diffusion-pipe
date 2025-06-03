@@ -251,10 +251,9 @@ class WanVacePipeline(WanPipeline):
             return {'latents': latents}
         return fn
         
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        # Convert inputs to model's dtype
-        latents = inputs['latents'].to(dtype=self.transformer.patch_embedding.weight.dtype)
+        # Keep latents in float32 like the regular pipeline
+        latents = inputs['latents'].float()
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
         mask = inputs['mask']
@@ -297,29 +296,32 @@ class WanVacePipeline(WanPipeline):
         # Scale timesteps to [0, 1000]
         t = t * 1000
 
-        # Get initial embeddings for the main input
-        x = [self.transformer.patch_embedding(u.unsqueeze(0)) for u in x_t]
+        # Get initial embeddings for the main input - explicitly set dtype to match model
+        model_dtype = self.transformer.patch_embedding.weight.dtype
+        x = [self.transformer.patch_embedding(u.unsqueeze(0).to(dtype=model_dtype)) for u in x_t]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_len = max([u.size(1) for u in x])
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
         # Create time embeddings - these must stay in float32
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-            e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t).float())
-            e0 = self.transformer.time_projection(e).unflatten(1, (6, self.transformer.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t).to(x.device, torch.float32))
+        e0 = self.transformer.time_projection(e).unflatten(1, (6, self.transformer.dim))
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # Process text embeddings like in vace_model.py
-        context = [emb[:length] for emb, length in zip(text_embeddings, seq_lens)]
+        # Process text embeddings - explicitly set dtype to match model
+        context = [emb[:length].to(dtype=model_dtype) for emb, length in zip(text_embeddings, seq_lens)]
         context = self.transformer.text_embedding(
             torch.stack([
-                torch.cat([u, u.new_zeros(self.transformer.text_len - u.size(0), u.size(1))])
+                torch.cat([u, u.new_zeros(self.transformer.text_len - u.size(0), u.size(1), dtype=model_dtype)])
                 for u in context
             ]))
 
-        # Create VACE context from latents and masks
-        vace_context = [torch.cat([l, m], dim=0) if m is not None else l for l, m in zip(x_t, mask)]
+        # Create VACE context from latents and masks - explicitly set dtype to match model
+        vace_context = [torch.cat([l.to(dtype=model_dtype), 
+                                 m.to(dtype=model_dtype) if m is not None else None], 
+                                dim=0) if m is not None else l.to(dtype=model_dtype) 
+                       for l, m in zip(x_t, mask)]
         
         # Generate hints using forward_vace
         vace_block_args = dict(
@@ -332,6 +334,13 @@ class WanVacePipeline(WanPipeline):
             context_lens=None
         )
         hints = self.transformer.forward_vace(x, vace_context, seq_len, vace_block_args)
+
+        # Convert all outputs to model dtype except time embeddings
+        x_t = x_t.to(dtype=model_dtype)
+        t = t.to(dtype=model_dtype)
+        target = target.to(dtype=model_dtype)
+        if mask is not None:
+            mask = mask.to(dtype=model_dtype)
 
         return (
             (x_t, t, hints, text_embeddings, seq_lens, 1.0, None, None),
@@ -374,7 +383,7 @@ class InitialLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.autocast('cuda', dtype=torch.bfloat16)
     def forward(self, inputs):
         for item in inputs:
             if torch.is_floating_point(item):
@@ -388,17 +397,19 @@ class InitialLayer(nn.Module):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # embeddings - ensure input is in correct dtype
+        x = [self.patch_embedding(u.unsqueeze(0).to(dtype=self.patch_embedding.weight.dtype)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         seq_len = seq_lens.max()
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
-        # time embeddings
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(x.device, torch.float32))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        # time embeddings - keep in float32 like in wan.py
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(x.device, torch.float32))
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         if context is not None:
@@ -417,9 +428,8 @@ class TransformerLayer(nn.Module):
         self.block_idx = block_idx
         self.offloader = offloader
 
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.autocast('cuda', dtype=torch.bfloat16)
     def forward(self, inputs):
-        import pdb; pdb.set_trace()  # Breakpoint 3: Check Base layer inputs/outputs
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
         # Get hints from previous layer's output
         hints = inputs[1] if isinstance(inputs, tuple) else None
@@ -438,9 +448,8 @@ class VaceTransformerLayer(nn.Module):
         self.block_idx = block_idx
         self.offloader = offloader
 
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.autocast('cuda', dtype=torch.bfloat16)
     def forward(self, inputs):
-        import pdb; pdb.set_trace()  # Breakpoint 2: Check Vace layer inputs/outputs
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
 
         self.offloader.wait_for_block(self.block_idx)
@@ -460,7 +469,7 @@ class FinalLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.autocast('cuda', dtype=torch.bfloat16)
     def forward(self, inputs):
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
         x = self.head(x, e)
