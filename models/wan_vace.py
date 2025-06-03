@@ -3,6 +3,7 @@ import json
 import math
 import re
 import os.path
+import types
 from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/Wan2_1'))
 
@@ -21,6 +22,7 @@ from utils.offloading import ModelOffloader
 from .wan import (umt5_keys_mapping_comfy, umt5_keys_mapping_kijai, umt5_keys_mapping, 
                   _t5, umt5_xxl, T5EncoderModel,
                   vae_encode, Head, WanPipeline,
+                  WanAttentionBlock,
 )
 
 import wan
@@ -28,8 +30,13 @@ from wan.modules.t5 import T5Encoder, T5Decoder, T5Model
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.vae import WanVAE
 from wan.modules.model import (
-    WanModel, VaceWanModel, sinusoidal_embedding_1d, WanLayerNorm, WanSelfAttention, WAN_CROSSATTENTION_CLASSES
+    WanModel, sinusoidal_embedding_1d, WanLayerNorm, WanSelfAttention, WAN_CROSSATTENTION_CLASSES
 )
+from wan.modules.vace_model import (
+    VaceWanModel,
+)
+from wan.vace import WanVace
+
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
 from safetensors.torch import load_file
@@ -118,7 +125,7 @@ class BaseWanAttentionBlock(WanAttentionBlock):
         x = super().forward(x, **kwargs)
         if self.block_id is not None:
             x = x + hints[self.block_id] * context_scale
-        return
+        return x
 
 # Patch these to remove some forced casting to float32, saving memory.
 wan.modules.model.WanAttentionBlock = WanAttentionBlock
@@ -213,22 +220,41 @@ class WanVacePipeline(WanPipeline):
     # def save_adapter(self, save_dir, peft_state_dict):
     # def save_model(self, save_dir, diffusers_sd):
     # def get_preprocess_media_file_fn(self):
-    # def get_call_text_encoder_fn(self, text_encoder):
+    def get_call_text_encoder_fn(self, text_encoder):
+        def fn(caption, is_video):
+            # Args are lists
+            p = next(text_encoder.model.parameters())
+            ids, mask = self.text_encoder.tokenizer(caption, return_mask=True, add_special_tokens=True)
+            ids = ids.to(p.device)
+            mask = mask.to(p.device)
+            seq_lens = mask.gt(0).sum(dim=1).long()
+            with torch.autocast(device_type=p.device.type, dtype=p.dtype):
+                text_embeddings = text_encoder.model(ids, mask)
+                return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
+        return fn
 
     # override: VACE does not use clip
     def get_vae(self):
-        vae = self.vae.model
-        return vae 
+        if not next(self.vae.model.parameters()).is_cuda:
+            self.vae.model = self.vae.model.cuda()
+        return self.vae.model
 
-    def get_call_vae_fn(self, vae_and_clip):
-        vae = self.get_vae()
-        p = next(vae.parameters())
-        tensor = tensor.to(p.device, p.dtype)
-        latents = vae_encode(tensor, self.vae)
-        return {'latents': latents}
+    def get_call_vae_fn(self, vae):
+        def fn(tensor):
+            # Move everything to CUDA
+            if not next(self.vae.model.parameters()).is_cuda:
+                self.vae.model = self.vae.model.cuda()
+            if not self.vae.scale[0].is_cuda:
+                self.vae.scale = [s.cuda() for s in self.vae.scale]
+            tensor = tensor.cuda()
+            latents = vae_encode(tensor, self.vae)
+            return {'latents': latents}
+        return fn
         
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        latents = inputs['latents'].float()
+        # Convert inputs to model's dtype
+        latents = inputs['latents'].to(dtype=self.transformer.patch_embedding.weight.dtype)
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
         mask = inputs['mask']
@@ -239,6 +265,7 @@ class WanVacePipeline(WanPipeline):
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)  # make mask same number of dims as target
+            mask = mask.to(dtype=latents.dtype)  # match latents dtype
 
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
         if timestep_sample_method == 'logit_normal':
@@ -270,15 +297,44 @@ class WanVacePipeline(WanPipeline):
         # Scale timesteps to [0, 1000]
         t = t * 1000
 
-        # Create VACE context
-        latents_list = [x for x in x_t]
-        masks_list = [m for m in mask] if mask is not None else None
-        z0 = self.transformer.vace_encode_frames(latents_list, None, masks_list)
-        m0 = self.transformer.vace_encode_masks(masks_list if masks_list else [None] * len(latents_list))
-        vace_context = self.transformer.vace_latent(z0, m0)
+        # Get initial embeddings for the main input
+        x = [self.transformer.patch_embedding(u.unsqueeze(0)) for u in x_t]
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        seq_len = max([u.size(1) for u in x])
+        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+
+        # Create time embeddings - these must stay in float32
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t).float())
+            e0 = self.transformer.time_projection(e).unflatten(1, (6, self.transformer.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # Process text embeddings like in vace_model.py
+        context = [emb[:length] for emb, length in zip(text_embeddings, seq_lens)]
+        context = self.transformer.text_embedding(
+            torch.stack([
+                torch.cat([u, u.new_zeros(self.transformer.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        # Create VACE context from latents and masks
+        vace_context = [torch.cat([l, m], dim=0) if m is not None else l for l, m in zip(x_t, mask)]
+        
+        # Generate hints using forward_vace
+        vace_block_args = dict(
+            x=x,
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=self.transformer.freqs,
+            context=context,
+            context_lens=None
+        )
+        hints = self.transformer.forward_vace(x, vace_context, seq_len, vace_block_args)
 
         return (
-            (x_t, t, vace_context, text_embeddings, seq_lens, 1.0, None, None),
+            (x_t, t, hints, text_embeddings, seq_lens, 1.0, None, None),
             (target, mask),
         )
 
@@ -410,6 +466,3 @@ class FinalLayer(nn.Module):
         x = self.head(x, e)
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x, dim=0)
-
-if __name__ == "__main__":
-
