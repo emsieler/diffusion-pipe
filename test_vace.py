@@ -3,13 +3,37 @@ import torch
 from pathlib import Path
 from models.wan_vace import WanVacePipeline
 from utils.common import AUTOCAST_DTYPE
+import argparse
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config_path', type=str, default='configs/vace_test.yaml')
+    return parser.parse_args()
+
+def prepare_pipeline_inputs(pipeline, vae, text_encoder, video_tensor, mask_tensor, caption, is_video=True):
+    """
+    Uses the pipeline's component functions to construct the complete
+    input dictionary required by the `prepare_inputs` method.
+    This mirrors the logic used by the internal data loader.
+    """
+    pixel_values = (video_tensor, mask_tensor)
+    
+    # 1. Call the VAE function to get the dictionary of latents
+    latents_dict = pipeline.get_call_vae_fn(vae)(pixel_values)
+
+    # 2. Call the text encoder function
+    text_encoder_outputs = pipeline.get_call_text_encoder_fn(text_encoder)(caption, is_video)
+    
+    # 3. Merge the results and add the mask
+    inputs = {**latents_dict, **text_encoder_outputs, 'mask': mask_tensor}
+    
+    return inputs
 
 def test_vace_pipeline():
-    # Test config based on wan_vace_14b_min_vram.toml
     config = {
         'model': {
             'type': 'wan_vace', 
-            'ckpt_path': '/home/em/code/volumetric-fix/Wan2.1-VACE-14B', 
+            'ckpt_path': '/workspace/models/Wan2.1-VACE-1.3B', 
             'dtype': 'bfloat16',
             'transformer_dtype': 'bfloat16',
             'timestep_sample_method': 'logit_normal',
@@ -17,11 +41,12 @@ def test_vace_pipeline():
         }
     }
 
-    print("Initializing Vace pipeline...")
+    # Initialize pipeline from the config dictionary
     pipeline = WanVacePipeline(config)
+    print("Loading diffusion model...")
     
     # Load test video
-    test_video_path = '/home/em/code/volumetric-fix/dataset/10frame_test.mp4'
+    test_video_path = '/workspace/dataset/10frame_test.mp4'
     if not os.path.exists(test_video_path):
         print(f"Please provide a valid test video path. Current path {test_video_path} does not exist.")
         return
@@ -30,7 +55,7 @@ def test_vace_pipeline():
     preprocess_fn = pipeline.get_preprocess_media_file_fn()
     video_data_list = preprocess_fn(test_video_path, mask_filepath=None)
     
-    video_tensor, mask = video_data_list[0]
+    video_tensor, spatial_mask = video_data_list[0]
     
     # Add batch dimension and move to correct device/dtype
     vae = pipeline.get_vae()
@@ -51,42 +76,36 @@ def test_vace_pipeline():
     
     # Get text embeddings using the pipeline's text encoder
     test_prompt = ["A test video"]
-    ids, mask = pipeline.text_encoder.tokenizer(
+    ids, text_mask = pipeline.text_encoder.tokenizer(
         test_prompt,
         return_mask=True,
         add_special_tokens=True
     )
     ids = ids.to(torch.device('cuda'))
-    mask = mask.to(torch.device('cuda'))
+    text_mask = text_mask.to(torch.device('cuda'))
     
-    text_embeddings = text_encoder(ids, mask)
+    text_embeddings = text_encoder(ids, text_mask)
 
-    # Prepare inputs
-    inputs = {
-        'latents': latents,
-        'text_embeddings': text_embeddings,
-        'seq_lens': None,  
-        'mask': mask
-    }
-
+    # Use the new helper function to prepare inputs
+    inputs = prepare_pipeline_inputs(pipeline, vae, text_encoder, video_tensor, spatial_mask, test_prompt, is_video=True)
+    
     print("Running forward pass...")
+    model_inputs, (target, target_mask) = pipeline.prepare_inputs(inputs)
+
     with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
-        model_inputs, targets = pipeline.prepare_inputs(inputs)
         x_t, t, vace_context, text_embeddings, seq_lens, vace_context_scale, clip_fea, y = model_inputs
         
         print("Converting to layers...")
         layers = pipeline.to_layers()
         
         print("Running through layers...")
-        x = x_t
         for i, layer in enumerate(layers):
             print(f"Processing layer {i+1}/{len(layers)}")
-            x = layer(model_inputs)
-            
-        print("\nTest completed successfully!")
-        print(f"Input shape: {x_t.shape}")
-        print(f"Output shape: {x.shape}")
-        print(f"Number of layers: {len(layers)}")
+            model_inputs = layer(*model_inputs)
+
+        final_output = model_inputs
+        print(f"Final output shape: {final_output.shape}")
+        print(f"Final output dtype: {final_output.dtype}")
         
         # Print memory usage
         print("\nMemory usage:")
