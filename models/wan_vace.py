@@ -127,7 +127,7 @@ class BaseWanAttentionBlock(WanAttentionBlock):
             x = x + hints[self.block_id] * context_scale
         return x
 
-# Patch these to remove some forced casting to float32, saving memory.
+# Patch to remove forced casting to float32, saving memory.
 wan.modules.model.WanAttentionBlock = WanAttentionBlock
 wan.modules.vace_model.VaceWanAttentionBlock = VaceWanAttentionBlock
 wan.modules.vace_model.BaseWanAttentionBlock = BaseWanAttentionBlock
@@ -140,98 +140,61 @@ class WanVacePipeline(WanPipeline):
     adapter_target_modules = ['VaceWanAttentionBlock', 'BaseWanAttentionBlock'] 
 
     def __init__(self, config):
-        self.config = config
-        self.model_config = self.config['model']
-        self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
-        ckpt_dir = self.model_config['ckpt_path']
-        dtype = self.model_config['dtype']
-        
-        self.skyreels = 'skyreels' in Path(ckpt_dir).name.lower()
-        if self.skyreels:
-            raise ValueError("Skyreels not supported for VACE")
-
-        self.original_model_config_path = os.path.join(ckpt_dir, 'config.json')
-        with open(self.original_model_config_path) as f:
-            json_config = json.load(f)
-        model_dim = json_config['dim']
-        
-        self.vace = (json_config['model_type'] == 'vace')
-        if self.vace:
-            if model_dim == 1536:
-                wan_config = wan_configs.t2v_1_3B
-            elif model_dim == 5120:
-                wan_config = wan_configs.t2v_14B
-            else:
-                raise ValueError(f"Model dimension {model_dim} not supported")
-
-        # This is the outermost class, not an nn.Module
-        t5_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
-        self.text_encoder = T5EncoderModel(
-            text_len=wan_config.text_len,
-            dtype=dtype,
-            device='cpu',
-            checkpoint_path=t5_model_path,
-            tokenizer_path=os.path.join(ckpt_dir, wan_config.t5_tokenizer),
-            shard_fn=None,
-        )
-
-        # Same here, this isn't a nn.Module.
-        # TODO: by default the VAE is float32, and therefore so are the latents. Do we want to change that?
-        self.vae = WanVAE(
-            vae_pth=os.path.join(ckpt_dir, wan_config.vae_checkpoint),
-            device='cpu',
-        )
-        # These need to be on the device the VAE will be moved to during caching.
-        self.vae.mean = self.vae.mean.to('cuda')
-        self.vae.std = self.vae.std.to('cuda')
-        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+        super().__init__(config)
+        self.transformer = self.load_diffusion_model()
 
     def load_diffusion_model(self):
-        dtype = self.model_config['dtype']
-        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
+        model_config = self.model_config
+        ckpt_path = Path(model_config['ckpt_path'])
+        dtype = getattr(torch, model_config['dtype'])
+        transformer_dtype = getattr(torch, model_config.get('transformer_dtype', model_config['dtype']))
 
-        if transformer_path := self.model_config.get('transformer_path', None):
-            self.transformer = VaceWanModelFromSafetensors.from_pretrained(  
+        # Load model
+        if transformer_path := model_config.get('transformer_path', None):
+            model = VaceWanModelFromSafetensors.from_pretrained(
                 transformer_path,
-                self.original_model_config_path,
+                os.path.join(ckpt_path, 'config.json'),
                 torch_dtype=dtype,
                 transformer_dtype=transformer_dtype,
             )
         else:
-            ckpt_path = Path(self.model_config['ckpt_path'])
+            # Multi-part safetensors loading
             with init_empty_weights():
-                self.transformer = VaceWanModel.from_config(ckpt_path / 'config.json')
+                model = VaceWanModel.from_config(ckpt_path / 'config.json')
+            
             state_dict = {}
             for shard in ckpt_path.glob('*.safetensors'):
+                print(f"Loading shard: {shard}")
                 with safetensors.safe_open(shard, framework="pt", device="cpu") as f:
                     for key in f.keys():
                         state_dict[key] = f.get_tensor(key)
-            for name, param in self.transformer.named_parameters():
+            
+            for name, param in model.named_parameters():
                 dtype_to_use = dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
-                set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+                set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
 
-        # Move model to CUDA after loading
-        self.transformer = self.transformer.cuda()
-        self.transformer.train()
-        for name, p in self.transformer.named_parameters():
+        model = model.cuda().eval().requires_grad_(False)
+        
+        # Store original parameter names
+        for name, p in model.named_parameters():
             p.original_name = name
 
-    # no changes made to class methods:
-    # def __getattr__(self, name):
-    # get_text_encoders(self):
-    # def save_adapter(self, save_dir, peft_state_dict):
-    # def save_model(self, save_dir, diffusers_sd):
-    # def get_preprocess_media_file_fn(self):
+        return model
+
+    def get_text_encoders(self):
+        if not next(self.text_encoder.model.parameters()).is_cuda:
+            self.text_encoder.model = self.text_encoder.model.cuda()
+        return [self.text_encoder.model]
+
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(caption, is_video):
-            # Args are lists
-            p = next(text_encoder.model.parameters())
+            device = next(text_encoder.parameters()).device
             ids, mask = self.text_encoder.tokenizer(caption, return_mask=True, add_special_tokens=True)
-            ids = ids.to(p.device)
-            mask = mask.to(p.device)
+            ids = ids.to(device)
+            mask = mask.to(device)
             seq_lens = mask.gt(0).sum(dim=1).long()
-            with torch.autocast(device_type=p.device.type, dtype=p.dtype):
-                text_embeddings = text_encoder.model(ids, mask)
+            with torch.autocast(device_type=device.type, dtype=text_encoder.dtype):
+                text_embeddings = text_encoder(ids, mask)
                 return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
         return fn
 
@@ -243,7 +206,6 @@ class WanVacePipeline(WanPipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            # Move everything to CUDA
             if not next(self.vae.model.parameters()).is_cuda:
                 self.vae.model = self.vae.model.cuda()
             if not self.vae.scale[0].is_cuda:
@@ -254,11 +216,17 @@ class WanVacePipeline(WanPipeline):
         return fn
         
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        # Keep latents in float32 like the regular pipeline
-        latents = inputs['latents'].float().cuda()
-        text_embeddings = [emb.cuda() for emb in inputs['text_embeddings']]
-        seq_lens = inputs['seq_lens'].cuda()
-        mask = inputs['mask'].cuda() if inputs['mask'] is not None else None
+        device = self.transformer.patch_embedding.weight.device
+        model_dtype = self.transformer.patch_embedding.weight.dtype
+
+        latents = inputs['latents'].float().to(device)
+        text_embeddings = inputs['text_embeddings']
+        if isinstance(text_embeddings, list):
+            text_embeddings = [emb.to(device) for emb in text_embeddings]
+        else:
+            text_embeddings = text_embeddings.to(device)
+        seq_lens = inputs['seq_lens'].to(device)
+        mask = inputs['mask'].to(device) if inputs['mask'] is not None else None
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -277,9 +245,9 @@ class WanVacePipeline(WanPipeline):
             raise NotImplementedError()
 
         if timestep_quantile is not None:
-            t = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
         else:
-            t = dist.sample((bs,)).to(latents.device)
+            t = dist.sample((bs,)).to(device)
 
         if timestep_sample_method == 'logit_normal':
             sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
@@ -298,71 +266,44 @@ class WanVacePipeline(WanPipeline):
         # Scale timesteps to [0, 1000]
         t = t * 1000
 
-        # Get initial embeddings for the main input - explicitly set dtype to match model
-        model_dtype = self.transformer.patch_embedding.weight.dtype
+        # Initial embeddings for main input - set dtype to match model
         x = [self.transformer.patch_embedding(u.unsqueeze(0).to(dtype=model_dtype)) for u in x_t]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long, device=x[0].device) for u in x])
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_len = max([u.size(1) for u in x])
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
 
-        # Create time embeddings - match model dtype
+        # Time embeddings - match model dtype
         t_model_dtype = t.to(dtype=model_dtype)
-        e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t_model_dtype).to(x.device, dtype=model_dtype))
+        e = self.transformer.time_embedding(sinusoidal_embedding_1d(self.transformer.freq_dim, t_model_dtype).to(device=device, dtype=model_dtype))
         e0 = self.transformer.time_projection(e).unflatten(1, (6, self.transformer.dim))
         assert e.dtype == model_dtype and e0.dtype == model_dtype, f"Time embeddings not in {model_dtype}: e={e.dtype}, e0={e0.dtype}"
 
-        # Process text embeddings - explicitly set dtype to match model
+        # Text embeddings - set dtype to match model
         context = [emb[:length].to(dtype=model_dtype) for emb, length in zip(text_embeddings, seq_lens)]
         context = self.transformer.text_embedding(
             torch.stack([
                 torch.cat([u, u.new_zeros(self.transformer.text_len - u.size(0), u.size(1), dtype=model_dtype)])
                 for u in context
-            ]))
+            ]).to(device))
 
-        # Create VACE context from latents and masks - explicitly set dtype to match model
+        # VACE context from latents and masks
         vace_list_for_forward_vace = []
-        print("\\nConstructing VACE context list:")
-        print(f"Shape of x_t (input latents): {x_t.shape}") # e.g. [B, F_orig, C_orig=96, H_orig_spatial]
+        print("\nConstructing VACE context list:")
+        print(f"Shape of x_t (input latents): {x_t.shape}")
 
-        # Permute x_t once to get [Batch, Channels, Frames, H_spatial]
-        # Original x_t dims: 0=Batch, 1=Frames, 2=Channels, 3=H_spatial
-        # Target x_t_perm dims: 0=Batch, 1=Channels, 2=Frames, 3=H_spatial
-        x_t_permuted = x_t.permute(0, 2, 1, 3) # Shape: [B, C_orig=96, F_orig, H_orig_spatial], e.g. [16, 96, 5, 54]
+        x_t = x_t.to(device=device, dtype=model_dtype)
+        x_t_permuted = x_t.permute(0, 2, 1, 3)
         print(f"Shape of x_t_permuted: {x_t_permuted.shape}")
-        
-        # TODO: Proper mask processing and concatenation needs to be verified here.
-        # If a mask is present, it should be processed and combined with x_t_permuted
-        # such that each item in vace_list_for_forward_vace has 96 channels.
-        # For now, this simplified logic assumes x_t_permuted itself provides the 96 channels
-        # or that mask handling is separate / a no-op if mask is None.
 
-        if mask is not None:
-            # This is a placeholder for correct mask processing.
-            # The current mask processing in the original code led to `torch.cat` that would
-            # increase channels beyond 96 if x_t_permuted already had 96.
-            # For the VACE model, often the input latents (x_t) might have fewer channels,
-            # and the mask provides additional channels to make up the total expected by vace_patch_embedding.
-            # However, logs indicate x_t itself has 96 channels.
-            # This part needs careful review based on how VACE context is truly formed with masks.
-            # For now, we'll assume if mask is present, we still primarily use x_t_permuted for simplicity
-            # to get the main error resolved. A more sophisticated mask integration might be needed.
-            print("Mask is present, current simplified VACE context logic might need review for mask integration.")
-            # Fallthrough to use x_t_permuted, or handle 'm' correctly if it was shaped like x_t_permuted items.
-            # The original cat was: torch.cat([l, m], dim=1)) where l and m were [B, C, F, H_spatial]
-            # This implies m should also be prepared per batch item and then cat on channels before unsqueeze.
-
-        for i in range(x_t_permuted.shape[0]):  # Iterate over the Batch dimension
-            item_slice = x_t_permuted[i] # Shape: [C_orig=96, F_orig, H_orig_spatial], e.g., [96, 5, 54]
+        for i in range(x_t_permuted.shape[0]):
+            item_slice = x_t_permuted[i]
             print(f"  Processing item {i} for VACE context list: original slice shape: {item_slice.shape}")
-
-            # Add W dimension: [C_orig=96, F_orig, H_orig_spatial, 1_for_W]
-            item_slice_5d = item_slice.unsqueeze(-1)  # Shape: [96, 5, 54, 1]
+            item_slice_5d = item_slice.unsqueeze(-1)
             print(f"  Item {i} after adding W dim: {item_slice_5d.shape}")
-            
-            vace_list_for_forward_vace.append(item_slice_5d.to(dtype=model_dtype))
+            vace_list_for_forward_vace.append(item_slice_5d.to(device=device, dtype=model_dtype))
 
-        print("\\nFinal vace_context (list of tensors to be passed to forward_vace):")
+        print("\nFinal vace_context (list of tensors to be passed to forward_vace):")
         if not vace_list_for_forward_vace:
             print("  List is empty.")
         for idx, tensor_item in enumerate(vace_list_for_forward_vace):
@@ -370,22 +311,21 @@ class WanVacePipeline(WanPipeline):
         
         # Generate hints using forward_vace
         vace_block_args = dict(
-            x=x,
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.transformer.freqs.to(x.device),
-            context=context,
+            x=x.to(device=device),
+            e=e0.to(device=device),
+            seq_lens=seq_lens.to(device=device),
+            grid_sizes=grid_sizes.to(device=device),
+            freqs=self.transformer.freqs.to(device=device),
+            context=context.to(device=device) if context is not None else None,
             context_lens=None
         )
         hints = self.transformer.forward_vace(x, vace_list_for_forward_vace, seq_len, vace_block_args)
 
-        # Convert all outputs to model dtype except time embeddings
-        x_t = x_t.to(dtype=model_dtype)
-        t = t.to(dtype=model_dtype)
-        target = target.to(dtype=model_dtype)
+        x_t = x_t.to(device=device, dtype=model_dtype)
+        t = t.to(device=device, dtype=model_dtype)
+        target = target.to(device=device, dtype=model_dtype)
         if mask is not None:
-            mask = mask.to(dtype=model_dtype)
+            mask = mask.to(device=device, dtype=model_dtype)
 
         return (
             (x_t, t, hints, text_embeddings, seq_lens, 1.0, None, None),
@@ -397,7 +337,7 @@ class WanVacePipeline(WanPipeline):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
         
-        # Process blocks in sequence, ensuring Vace blocks come before corresponding Base blocks to provide context
+        # Process blocks in sequence, (Vace blocks come before corresponding Base blocks to provide context)
         for i in range(len(transformer.blocks)):
             if i in transformer.vace_layers:
                 vace_idx = transformer.vace_layers.index(i)
@@ -442,7 +382,7 @@ class InitialLayer(nn.Module):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # embeddings - ensure input is in correct dtype
+        # embeddings -  make sure correct dtype
         x = [self.patch_embedding(u.unsqueeze(0).to(dtype=self.patch_embedding.weight.dtype)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]

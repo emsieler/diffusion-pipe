@@ -5,15 +5,15 @@ from models.wan_vace import WanVacePipeline
 from utils.common import AUTOCAST_DTYPE
 
 def test_vace_pipeline():
-    # Test configuration based on wan_vace_14b_min_vram.toml
+    # Test config based on wan_vace_14b_min_vram.toml
     config = {
         'model': {
-            'type': 'wan_vace',  # Changed to wan_vace
-            'ckpt_path': '/data2/imagegen_models/Wan2.1-T2V-14B',  # From toml
+            'type': 'wan_vace', 
+            'ckpt_path': '/home/em/code/volumetric-fix/Wan2.1-VACE-14B', 
             'dtype': 'bfloat16',
-            'transformer_dtype': 'float8',  # From toml
+            'transformer_dtype': 'bfloat16',
             'timestep_sample_method': 'logit_normal',
-            'llm_path': None,  # Will use default from checkpoint
+            'llm_path': None,  # use default from ckpt
         }
     }
 
@@ -21,28 +21,52 @@ def test_vace_pipeline():
     pipeline = WanVacePipeline(config)
     
     # Load test video
-    test_video_path = 'path/to/test/video.mp4'  # Update this path
+    test_video_path = '/home/em/code/volumetric-fix/dataset/10frame_test.mp4'
     if not os.path.exists(test_video_path):
         print(f"Please provide a valid test video path. Current path {test_video_path} does not exist.")
         return
 
     print("Loading and preprocessing video...")
     preprocess_fn = pipeline.get_preprocess_media_file_fn()
-    video_data = preprocess_fn(test_video_path)
+    video_data_list = preprocess_fn(test_video_path, mask_filepath=None)
+    
+    video_tensor, mask = video_data_list[0]
+    
+    # Add batch dimension and move to correct device/dtype
+    vae = pipeline.get_vae()
+    p = next(vae.parameters())
+    device, dtype = p.device, p.dtype
+    video_tensor = video_tensor.unsqueeze(0).to(device, dtype)
+    
+    # Process through VAE to get latents
+    vae_fn = pipeline.get_call_vae_fn(vae)
+    latents_dict = vae_fn(video_tensor)
+    latents = latents_dict['latents']
     
     print("Generating text embeddings...")
     text_encoder = pipeline.get_text_encoders()[0]
-    text_embeddings = text_encoder(
-        ["A test video"],  # Test prompt
-        torch.device('cuda')
+    
+    # Move text encoder to CUDA first
+    text_encoder = text_encoder.cuda()
+    
+    # Get text embeddings using the pipeline's text encoder
+    test_prompt = ["A test video"]
+    ids, mask = pipeline.text_encoder.tokenizer(
+        test_prompt,
+        return_mask=True,
+        add_special_tokens=True
     )
+    ids = ids.to(torch.device('cuda'))
+    mask = mask.to(torch.device('cuda'))
+    
+    text_embeddings = text_encoder(ids, mask)
 
     # Prepare inputs
     inputs = {
-        'latents': video_data['latents'],
+        'latents': latents,
         'text_embeddings': text_embeddings,
-        'seq_lens': video_data['seq_lens'],
-        'mask': video_data.get('mask', None)
+        'seq_lens': None,  
+        'mask': mask
     }
 
     print("Running forward pass...")
