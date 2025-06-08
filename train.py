@@ -307,6 +307,9 @@ if __name__ == '__main__':
     elif model_type == 'wan':
         from models import wan
         model = wan.WanPipeline(config)
+    elif model_type == 'wan_vace':
+        from models import wan_vace
+        model = wan_vace.WanVacePipeline(config)
     elif model_type == 'chroma':
         from models import chroma
         model = chroma.ChromaPipeline(config)
@@ -471,6 +474,12 @@ if __name__ == '__main__':
 
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
+        if model.name == 'wan_vace':
+            raise ValueError(
+                "Configuration error: Block swapping is enabled (blocks_to_swap > 0), but the 'wan_vace' model does not support it. "
+                "Please disable block swapping by setting blocks_to_swap = 0 in your config file."
+            )
+        
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
         # Don't automatically move to GPU, we'll do that ourselves.
