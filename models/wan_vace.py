@@ -308,6 +308,31 @@ class WanVacePipeline(WanPipeline):
                 return {'latents': latents, 'inactive_latents': inactive_latents, 'reactive_latents': reactive_latents, 'mask': mask}
         return fn
 
+    def process_vace_mask(self, mask, vae_stride=(1, 8, 8), device=None, dtype=None):
+        """
+        Process mask according to original VACE implementation.
+        Args:
+            mask: Input mask tensor of shape (bs, 1, num_frames, h, w)
+            vae_stride: Tuple of (temporal_stride, height_stride, width_stride)
+            device: Device to place output tensor on
+            dtype: Data type of output tensor
+        Returns:
+            Processed mask tensor of shape (bs, 64, num_frames, h, w)
+        """
+        bs, _, num_frames, height, width = mask.shape
+        
+        # Reshape to match original processing
+        mask = mask.view(bs, num_frames, height, vae_stride[1], width, vae_stride[2])
+        mask = mask.permute(0, 3, 5, 1, 2, 4)
+        mask = mask.reshape(bs, vae_stride[1] * vae_stride[2], num_frames, height, width)
+        
+        if device is not None:
+            mask = mask.to(device)
+        if dtype is not None:
+            mask = mask.to(dtype)
+        
+        return mask
+
     def prepare_inputs(self, inputs, timestep_quantile=None):
         device = self.transformer.patch_embedding.weight.device
         model_dtype = self.transformer.patch_embedding.weight.dtype
@@ -324,10 +349,8 @@ class WanVacePipeline(WanPipeline):
 
         bs, channels, num_frames, h, w = inactive_latents.shape
 
-        # ---------------------------------------------------------
-        # Handle mask tensor of arbitrary dimensionality (None/2D/3D/4D/5D)
-        # and convert it to shape (bs, 1, num_frames, h_latent, w_latent)
-        # ---------------------------------------------------------
+        # Handle mask tensor of any dimensions
+        # convert to shape (bs, 1, num_frames, h_latent, w_latent)
         if mask is not None:
             mask = mask.to(device)
             # Possible shapes:
@@ -362,14 +385,20 @@ class WanVacePipeline(WanPipeline):
 
             single_channel_mask = interpolated_mask
 
-            # VACE context (repeat to 64 channels)
-            mask_processed = single_channel_mask.repeat(1, 64, 1, 1, 1).to(dtype=model_dtype)
+            try:
+                # Try the original VACE processing
+                mask_processed = self.process_vace_mask(single_channel_mask, vae_stride=(1, 8, 8), device=device, dtype=model_dtype)
+            except Exception as e:
+                print(f"Warning: Original VACE mask processing failed, falling back to repeat method: {e}")
+                # Fallback to the working repeat method
+                mask_processed = single_channel_mask.repeat(1, 64, 1, 1, 1).to(dtype=model_dtype)
 
-            # loss calculation
+            # loss
             target_mask = single_channel_mask.to(dtype=model_dtype)
         else:
             mask_processed = torch.zeros(bs, 64, num_frames, h, w, device=device, dtype=model_dtype)
             target_mask = None
+
         
         vace_context = torch.cat([inactive_latents, reactive_latents, mask_processed], dim=1)
 
