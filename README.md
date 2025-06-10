@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream.
+Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3.
 
 **Work in progress.** This is a side project for me and my time is limited. I will try to add new models and features when I can.
 
@@ -15,6 +15,9 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-06-10
+  - Stable Diffusion 3 LoRA training is supported.
+  - Pinned Deepspeed version to fix error caused by Deepspeed 0.17.1.
 - 2025-05-22
   - Add Automagic optimizer
   - Support i2v training for LTX-Video. Thanks @GallenShao for the PR!

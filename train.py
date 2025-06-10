@@ -84,7 +84,7 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 
 def set_config_defaults(config):
     # Force the user to set this. If we made it a default of 1, it might use a lot of disk space.
-    assert 'save_every_n_epochs' in config
+    assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
@@ -316,6 +316,9 @@ if __name__ == '__main__':
     elif model_type == 'hidream':
         from models import hidream
         model = hidream.HiDreamPipeline(config)
+    elif model_type == 'sd3':
+        from models import sd3
+        model = sd3.SD3Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
