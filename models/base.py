@@ -197,6 +197,12 @@ class BasePipeline:
             modified_state_dict[k] = v
         self.transformer.load_state_dict(modified_state_dict, strict=False)
 
+    def load_and_fuse_adapter(self, path):
+        peft_config = peft.LoraConfig.from_pretrained(path)
+        lora_model = peft.get_peft_model(self.transformer, peft_config)
+        self.load_adapter_weights(path)
+        lora_model.merge_and_unload()
+
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
 

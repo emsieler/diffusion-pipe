@@ -84,7 +84,7 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 
 def set_config_defaults(config):
     # Force the user to set this. If we made it a default of 1, it might use a lot of disk space.
-    assert 'save_every_n_epochs' in config
+    assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
@@ -307,12 +307,18 @@ if __name__ == '__main__':
     elif model_type == 'wan':
         from models import wan
         model = wan.WanPipeline(config)
+    elif model_type == 'wan_vace':
+        from models import wan_vace
+        model = wan_vace.WanVacePipeline(config)
     elif model_type == 'chroma':
         from models import chroma
         model = chroma.ChromaPipeline(config)
     elif model_type == 'hidream':
         from models import hidream
         model = hidream.HiDreamPipeline(config)
+    elif model_type == 'sd3':
+        from models import sd3
+        model = sd3.SD3Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -471,6 +477,12 @@ if __name__ == '__main__':
 
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
+        if model.name == 'wan_vace':
+            raise ValueError(
+                "Configuration error: Block swapping is enabled (blocks_to_swap > 0), but the 'wan_vace' model does not support it. "
+                "Please disable block swapping by setting blocks_to_swap = 0 in your config file."
+            )
+        
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
         # Don't automatically move to GPU, we'll do that ourselves.

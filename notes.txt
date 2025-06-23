@@ -1,0 +1,28 @@
+commit: brute force fixed  Input type (c10::Half) and bias type (c10::BFloat16) should be the same  
+
+Traceback (most recent call last):
+  File "/workspace/diffusion-pipe/test_vace.py", line 133, in <module>
+    test_vace_pipeline() 
+    ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/diffusion-pipe/test_vace.py", line 110, in test_vace_pipeline
+    model_inputs, targets = pipeline.prepare_inputs(inputs)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/anaconda3/envs/diffusion-pipe/lib/python3.12/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/diffusion-pipe/models/wan_vace.py", line 301, in prepare_inputs
+    x = [self.transformer.patch_embedding(u.unsqueeze(0)) for u in x_t]
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/anaconda3/envs/diffusion-pipe/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/anaconda3/envs/diffusion-pipe/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/anaconda3/envs/diffusion-pipe/lib/python3.12/site-packages/torch/nn/modules/conv.py", line 725, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/anaconda3/envs/diffusion-pipe/lib/python3.12/site-packages/torch/nn/modules/conv.py", line 720, in _conv_forward
+    return F.conv3d(
+           ^^^^^^^^^
+RuntimeError: Input type (c10::Half) and bias type (c10::BFloat16) should be the same

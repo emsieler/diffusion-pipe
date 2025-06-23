@@ -11,6 +11,7 @@
 |Wan2.1          |✅    |❌              |✅                |
 |Chroma          |✅    |✅              |✅                |
 |HiDream         |✅    |❌              |✅                |
+|SD3             |✅    |❌              |✅                |
 
 
 ## SDXL
@@ -222,3 +223,17 @@ Due to how the Llama3 text embeddings are computed, the Llama3 text encoder must
 Without block swapping, you will need 48GB VRAM, or 2x24GB with pipeline parallelism. With enough block swapping you can train on a single 24GB GPU. Using nf4 quantization also allows training with 24GB, but there may be some quality decrease.
 
 HiDream LoRAs are saved in ComfyUI format.
+
+## Stable Diffusion 3
+```
+[model]
+type = 'sd3'
+diffusers_path = '/data2/imagegen_models/stable-diffusion-3.5-medium'
+dtype = 'bfloat16'
+#transformer_dtype = 'float8'
+#flux_shift = true
+```
+
+Stable Diffusion 3 LoRA training is supported. You need the full Diffusers folder for the model. Tested on SD3.5 Medium and Large.
+
+SD3 LoRAs are saved in Diffusers format. This format works in ComfyUI.
